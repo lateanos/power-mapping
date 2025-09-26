@@ -64,27 +64,34 @@ $(window).on("load", function () {
 
   /**
    * Given a collection of points, determines the layers based on 'Group'
-   * column in the spreadsheet.
+   * column in the spreadsheet, with support for multiple sheets.
    */
   function determineLayers(points) {
     var groups = [];
     var layers = {};
 
     for (var i in points) {
-      var group = points[i].Group;
-      if (group && groups.indexOf(group) === -1) {
-        // Add group to groups
-        groups.push(group);
+      // Create unique group names by combining sheet source and group name
+      var groupName = points[i].Group;
+      var source = points[i].SourceSheet || points[i].SourceFile || "Points";
 
-        // Add color to the crosswalk
-        group2color[group] =
+      // Create unique group identifier
+      var uniqueGroup = source + ":" + (groupName || "Default");
+
+      if (uniqueGroup && groups.indexOf(uniqueGroup) === -1) {
+        groups.push(uniqueGroup);
+
+        // Store color information
+        group2color[uniqueGroup] =
           points[i]["Marker Icon"].indexOf(".") > 0
             ? points[i]["Marker Icon"]
             : points[i]["Marker Color"];
       }
+
+      // Also store the unique group name with the point for later reference
+      points[i].UniqueGroup = uniqueGroup;
     }
 
-    // if none of the points have named layers, return no layers
     if (groups.length === 0) {
       layers = undefined;
     } else {
@@ -142,7 +149,8 @@ $(window).on("load", function () {
         );
 
         if (layers !== undefined && layers.length !== 1) {
-          marker.addTo(layers[point.Group]);
+          // Use the unique group name instead of just point.Group
+          marker.addTo(layers[point.UniqueGroup]);
         }
 
         markerArray.push(marker);
@@ -1159,37 +1167,63 @@ $(window).on("load", function () {
             });
 
             if (sheets.length === 0 || !sheets.includes("Options")) {
-              ("Could not load data from the Google Sheet");
+              alert("Could not load data from the Google Sheet");
             }
 
-            // First, read 3 sheets: Options, Points, and Polylines
-            $.when(
+            // Get all point sheets (Points, Points1, Points2, etc.)
+            var pointSheets = sheets.filter(function (name) {
+              return name.indexOf("Points") === 0;
+            });
+
+            // Get all polygon sheets
+            var polygonSheets = sheets.filter(function (name) {
+              return name.indexOf("Polygons") === 0;
+            });
+
+            // First, load Options, Polylines, and all Points sheets
+            var sheetRequests = [
               $.getJSON(
                 apiUrl + spreadsheetId + "/values/Options?key=" + googleApiKey
               ),
               $.getJSON(
-                apiUrl + spreadsheetId + "/values/Points?key=" + googleApiKey
-              ),
-              $.getJSON(
                 apiUrl + spreadsheetId + "/values/Polylines?key=" + googleApiKey
-              )
-            ).done(function (options, points, polylines) {
-              // Which sheet names contain polygon data?
-              var polygonSheets = sheets.filter(function (name) {
-                return name.indexOf("Polygons") === 0;
-              });
+              ),
+            ];
 
-              // Define a recursive function to fetch data from a polygon sheet
+            // Add all point sheets to requests
+            pointSheets.forEach(function (sheetName) {
+              sheetRequests.push(
+                $.getJSON(
+                  apiUrl +
+                    spreadsheetId +
+                    "/values/" +
+                    sheetName +
+                    "?key=" +
+                    googleApiKey
+                )
+              );
+            });
+
+            $.when.apply($, sheetRequests).done(function () {
+              var options = parse(arguments[0]);
+              var polylines = parse(arguments[1]);
+
+              // Combine all points sheets
+              var allPoints = [];
+              for (var i = 2; i < arguments.length; i++) {
+                var pointsData = parse(arguments[i]);
+                // Add sheet name as a property to identify source
+                pointsData.forEach(function (point) {
+                  point.SourceSheet = pointSheets[i - 2];
+                });
+                allPoints = allPoints.concat(pointsData);
+              }
+
+              // Define a recursive function to fetch data from polygon sheets
               var fetchPolygonsSheet = function (polygonSheets) {
-                // Load map once all polygon sheets have been loaded (if any)
                 if (polygonSheets.length === 0) {
-                  onMapDataLoad(
-                    parse(options),
-                    parse(points),
-                    parse(polylines)
-                  );
+                  onMapDataLoad(options, allPoints, polylines);
                 } else {
-                  // Fetch another polygons sheet
                   $.getJSON(
                     apiUrl +
                       spreadsheetId +
@@ -1205,7 +1239,6 @@ $(window).on("load", function () {
                 }
               };
 
-              // Start recursive function
               fetchPolygonsSheet(polygonSheets);
             });
           }
@@ -1218,36 +1251,56 @@ $(window).on("load", function () {
     },
 
     /*
-       Loading data from CSV files.
-       */
+     Loading data from CSV files.
+     */
     success: function () {
       var parse = function (s) {
         return Papa.parse(s[0], { header: true }).data;
       };
 
-      $.when(
-        $.get("./csv/Options.csv"),
-        $.get("./csv/Points.csv"),
-        $.get("./csv/Polylines.csv")
-      ).done(function (options, points, polylines) {
-        function loadPolygonCsv(n) {
-          $.get(
-            "./csv/Polygons" + (n === 0 ? "" : n) + ".csv",
-            function (data) {
-              createPolygonSettings(parse([data]));
-              loadPolygonCsv(n + 1);
+      // Function to load multiple point CSV files
+      function loadPointCsv(n, callback, pointsData) {
+        pointsData = pointsData || [];
+        var fileName = "./csv/Points" + (n === 0 ? "" : n) + ".csv";
+
+        $.get(fileName, function (data) {
+          var parsedData = parse([data]);
+          // Add source file information
+          parsedData.forEach(function (point) {
+            point.SourceFile = "Points" + (n === 0 ? "" : n);
+          });
+          pointsData = pointsData.concat(parsedData);
+          loadPointCsv(n + 1, callback, pointsData);
+        }).fail(function () {
+          // No more point sheets to load, continue with other data
+          callback(pointsData);
+        });
+      }
+
+      $.when($.get("./csv/Options.csv"), $.get("./csv/Polylines.csv")).done(
+        function (options, polylines) {
+          // Load all point sheets first
+          loadPointCsv(0, function (allPoints) {
+            // Then load polygon sheets
+            function loadPolygonCsv(n) {
+              $.get(
+                "./csv/Polygons" + (n === 0 ? "" : n) + ".csv",
+                function (data) {
+                  createPolygonSettings(parse([data]));
+                  loadPolygonCsv(n + 1);
+                }
+              ).fail(function () {
+                // No more sheets to load, initialize the map with combined points
+                onMapDataLoad(parse(options), allPoints, parse(polylines));
+              });
             }
-          ).fail(function () {
-            // No more sheets to load, initialize the map
-            onMapDataLoad(parse(options), parse(points), parse(polylines));
+
+            loadPolygonCsv(0);
           });
         }
-
-        loadPolygonCsv(0);
-      });
+      );
     },
   });
-
   /**
    * Reformulates documentSettings as a dictionary, e.g.
    * {"webpageTitle": "Leaflet Boilerplate", "infoPopupText": "Stuff"}
