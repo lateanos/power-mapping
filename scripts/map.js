@@ -145,7 +145,10 @@ $(window).on("load", function () {
             point["Name"] +
             "</b><br>" +
             (point["Image"] ? '<img src="' + point["Image"] + '"><br>' : "") +
-            point["Description"]
+            point["Description"] +
+            "<br>" +
+            "Allignment: " +
+            point["Allignment"]
         );
 
         if (layers !== undefined && layers.length !== 1) {
